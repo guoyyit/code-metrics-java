@@ -22,20 +22,23 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
 /**
  * Orchestrates full and incremental analyses.
  *
  * <p>Determinism guarantees: files are scanned in sorted order, findings are
  * sorted, and all aggregate numbers are computed from the same ordered
- * inputs, so repeated runs over identical inputs produce byte-identical
- * reports (apart from timestamps and report id). Each invocation uses local
- * collections only; the only shared components are stateless workers and
- * the bounded memory limiter, so concurrent analyses never cross-talk.
+ * inputs. The report id is a stable hash of revision id, rule-config hash
+ * and source code content, so repeated runs over identical inputs produce
+ * the same id and byte-identical reports apart from timestamps; run mode,
+ * timing, scheduling and restarts never influence the id. Analyses with the
+ * same id are serialized so concurrent duplicate submissions cannot race.
  */
 @Service
 public class AnalyzerService {
@@ -47,6 +50,7 @@ public class AnalyzerService {
     private final IncrementalCache incrementalCache;
     private final ReportRepository reportRepository;
     private final SuppressionService suppressionService;
+    private final ConcurrentHashMap<String, Object> idLocks = new ConcurrentHashMap<>();
 
     public AnalyzerService(MetricsProperties properties,
                            SourceFileScanner scanner,
@@ -74,6 +78,23 @@ public class AnalyzerService {
         String revision = resolveRevision(root, request.revision());
 
         List<SourceFile> sources = scanner.scan(root);
+        String reportId = deterministicReportId(revision, configHash, sources);
+        Object idLock = idLocks.computeIfAbsent(reportId, key -> new Object());
+        synchronized (idLock) {
+            try {
+                return runAnalysis(request, root, config, configHash, analyzerVersion,
+                        revision, sources, reportId, startedAt);
+            } finally {
+                idLocks.remove(reportId, idLock);
+            }
+        }
+    }
+
+    private AnalysisReport runAnalysis(AnalysisRequest request, Path root,
+                                       RuleConfig config, String configHash,
+                                       String analyzerVersion, String revision,
+                                       List<SourceFile> sources, String reportId,
+                                       Instant startedAt) {
         List<FileMetrics> metrics = new ArrayList<>();
         List<SmellFinding> findings = new ArrayList<>();
         List<FileFailure> failures = new ArrayList<>();
@@ -118,8 +139,6 @@ public class AnalyzerService {
         failures.sort(Comparator.comparing(FileFailure::path));
 
         Instant finishedAt = Instant.now();
-        String reportId = "RPT-" + Fingerprints.sha256(
-                revision + "|" + configHash + "|" + startedAt).substring(0, 12);
         AnalysisReport report = new AnalysisReport(
                 reportId,
                 revision,
@@ -137,6 +156,16 @@ public class AnalyzerService {
                         reusedCount.get(), request.incremental()));
         reportRepository.save(report);
         return report;
+    }
+
+    private String deterministicReportId(String revision, String configHash,
+                                         List<SourceFile> sources) {
+        String codeFingerprint = sources.stream()
+                .map(source -> source.path() + ":" + source.contentHash())
+                .collect(Collectors.joining("\n"));
+        return "RPT-" + Fingerprints.sha256(
+                "v1|" + revision + "|" + configHash + "|"
+                        + Fingerprints.sha256(codeFingerprint)).substring(0, 12);
     }
 
     private PerFileResult processOne(SourceFile source, RuleConfig config,
@@ -188,6 +217,9 @@ public class AnalyzerService {
         long methods = files.stream()
                 .mapToLong(file -> file.summary().totalMethods())
                 .sum();
+        long totalParameters = files.stream()
+                .mapToLong(file -> file.summary().totalParameters())
+                .sum();
         long activeFindings = findings.stream().filter(finding -> !finding.suppressed()).count();
         long suppressedFindings = findings.stream().filter(SmellFinding::suppressed).count();
 
@@ -198,6 +230,7 @@ public class AnalyzerService {
         summary.put("reusedFiles", (double) reusedFiles);
         summary.put("sourceLinesOfCode", (double) sloc);
         summary.put("totalMethods", (double) methods);
+        summary.put("totalParameters", (double) totalParameters);
         summary.put("totalComplexity", (double) totalComplexity);
         summary.put("maxComplexity", (double) maxComplexity);
         summary.put("totalFanOut", (double) totalFanOut);

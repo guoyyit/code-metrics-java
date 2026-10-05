@@ -17,7 +17,8 @@ public record BaselineComparison(
             String qualifiedName,
             double baselineValue,
             double targetValue,
-            double delta
+            double delta,
+            String direction
     ) {
     }
 

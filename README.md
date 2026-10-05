@@ -63,3 +63,7 @@ mvn test
 - 豁免持久化生效/撤销、基线新增/消除与趋势、对比可复现
   （`SuppressionAndBaselineTest`）；
 - 崩溃后暂存清理、已完成报告与增量缓存存活（`RecoveryTest`）。
+- 报告 id 对 revision/代码/配置确定性派生：重复运行、全量与增量、并发、重启/中断重跑
+  均得到同一 id，重复提交幂等不产生重复记录（`DeterministicReportIdTest`）；
+- 趋势对比只含结构度量（方法/类型/报告三级），断言受控变更下的具体条目集合、方向与
+  差值，运行元数据仅保留在汇总快照中，重复对比逐项一致（`MetricTrendComparisonTest`）。

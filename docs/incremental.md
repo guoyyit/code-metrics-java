@@ -47,6 +47,32 @@
 
 只有全部文件处理完成、报告对象构建完毕后才会发布，因此**不存在“部分可见”的报告**。
 
+## 报告 id 的确定性与幂等重跑
+
+报告 id 形如 `RPT-<12 位十六进制>`，由以下三项的 SHA-256 摘要确定性派生：
+
+1. 提交标识 `revision`；
+2. 规则配置哈希 `configHash`（规则开关、阈值、范围、路径过滤的完整 JSON 摘要）；
+3. 代码内容指纹：扫描到的全部源文件按相对路径排序后的
+   `(相对路径, 文件内容 SHA-256)` 拼接摘要。
+
+下列因素**均不参与** id 计算，因此不会改变报告 id：
+
+- 运行时刻（开始/结束时间）、执行顺序、线程并发调度、进程重启；
+- 全量/增量执行模式（二者业务结果逐项一致，报告 id 必然一致）；
+- 工作根目录的绝对路径（仅相对路径与文件内容入指纹）；
+- 增量缓存复用数等运行元数据。
+
+revision、代码内容、规则配置三者中任意一项变化，报告 id 都会变化。
+
+幂等语义：
+
+- 同一提交重复分析时**按 revision 覆盖同一文件**，历史报告列表中同一提交始终只有一条记录；
+- 覆盖旧结果时报告 id 保持不变（id 只取决于输入，不随重跑时间变化）；
+- 分析中断后重新提交同一批次，暂存目录在启动时被清理，重跑得到与完整运行一致的报告 id；
+- 并发对同一提交提交多次分析时，服务按报告 id 串行化同一批次，各次返回的 id 与业务结果
+  完全一致，不产生重复记录。
+
 ## 崩溃恢复
 
 `ReportRepository` 启动时清理所有残留的 `*.staging` 目录（中断的批次）：
@@ -73,8 +99,39 @@
 
 - 坏味道按稳定指纹对齐，输出 `added`（目标有、基线无）与 `removed`（基线有、目标无），
   已豁免命中不参与增删集合；
-- 度量趋势按全限定类型名、方法 id 对齐，仅保留非零差异（`METHOD`/`TYPE`/`REPORT`
-  三个作用域）；
-- 同一份基线与目标的对比结果确定且可复现（测试以对象相等断言）。
-  注意：方法 id 含完整签名，形参变化会体现为“旧方法消除 + 新方法出现”，
-  而类型级与报告级汇总会给出聚合计数的趋势。
+- 度量趋势按稳定标识对齐，仅保留非零差异，覆盖 `METHOD`/`TYPE`/`REPORT` 三个作用域：
+  - 方法按 `类型全限定名 + "#" + 方法名` 对齐（**不含形参签名**），因此给方法新增一个
+    参数会体现为同一条方法趋势 `parameterCount: N -> N+1`，方向 `UP`，而不是“旧方法消除 +
+    新方法出现”；
+  - 类型按全限定类型名对齐；
+  - 报告级汇总按固定的结构度量键对齐。
+- 每条变化包含 `baselineValue`、`targetValue`、`delta = target - baseline` 与
+  `direction`（`delta > 0` 为 `UP`，`delta < 0` 为 `DOWN`，零差异条目不输出）。
+- 指标变化列表**只包含代码结构度量**。属于结构度量的报告级字段为：
+  `sourceLinesOfCode`、`totalMethods`、`totalParameters`、`totalComplexity`、
+  `maxComplexity`、`totalFanOut`；方法级为 `linesOfCode`、`cyclomaticComplexity`、
+  `parameterCount`、`maxNestingDepth`；类型级为 `linesOfCode`、`methodCount`、
+  `weightedMethodComplexity`、`fanOut`。
+- 下列运行元数据**不会**作为指标变化条目输出，但仍原样保留在对比结果两侧的
+  `baseline.values` / `target.values` 汇总快照中：`totalFiles`、`analyzedFiles`、
+  `failedFiles`、`reusedFiles`、`incremental`、`activeFindings`、`suppressedFindings`。
+- 变化条目按 `(scope, metric, qualifiedName)` 稳定排序；同一份基线与目标重复对比，
+  结果逐项一致且条目顺序稳定（测试以对象相等断言）。
+
+## 验证方法
+
+通过 `mvn test` 运行的自动化用例直接覆盖上述保证：
+
+- `DeterministicReportIdTest`
+  - `repeatedRunsReturnIdenticalReportId`：同一提交重复运行，报告 id 与业务内容一致；
+  - `fullAndIncrementalRunsShareReportId`：全量与增量运行报告 id 一致；
+  - `reportIdChangesWhenAnyInputChanges`：revision 或代码任一变化即换 id，根路径变化不换；
+  - `duplicateSubmissionsAreIdempotent`：重复提交覆盖同一条记录，id 保持不变；
+  - `concurrentDuplicateSubmissionsReturnOneConsistentResult`：6 路并发同一提交得到同一 id；
+  - `resubmissionAfterSimulatedInterruptKeepsReportId`：模拟重启清理暂存后重跑，id 不变。
+- `MetricTrendComparisonTest`
+  - `metricDeltasCaptureDirectionAndValueAcrossAllScopes`：受控源码变更下，方法级
+    `parameterCount` 加一且 `UP`，类型级与报告级 `fanOut` 减一且 `DOWN`；
+  - `runMetadataNeverAppearsInMetricDeltas`：运行元数据不进入指标变化列表，且仍保留在
+    两侧汇总快照中；
+  - `repeatedComparisonsAreItemWiseAndOrderIdentical`：相同输入重复对比逐项一致、顺序稳定。

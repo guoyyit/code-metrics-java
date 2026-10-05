@@ -11,8 +11,10 @@ import org.springframework.stereotype.Component;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Compares two completed reports deterministically.
@@ -20,11 +22,28 @@ import java.util.Map;
  * <p>Findings are matched by their stable fingerprint (rule + path +
  * type/member), so the same logical finding reported at a shifted line is
  * still recognized instead of appearing as removed+added. Metric deltas are
- * aligned by fully qualified type name or method id. Suppressed findings
- * are excluded from the added/removed sets.
+ * aligned by fully qualified type name or {@code type#methodName} (signatures
+ * are intentionally ignored so a parameter change is a trend, not a rename).
+ * Report-level deltas cover structural metrics only; run metadata stays in
+ * the summary snapshots. Suppressed findings are excluded from the
+ * added/removed sets.
  */
 @Component
 public class BaselineComparator {
+
+    /**
+     * Report-level summary keys that describe code structure and therefore
+     * participate in the metric change list. Every other summary key is
+     * run metadata (file counts, cache reuse, mode flag, finding counters)
+     * and stays only in the two {@code SummarySnapshot}s.
+     */
+    private static final Set<String> STRUCTURAL_SUMMARY_METRICS = Set.of(
+            "sourceLinesOfCode",
+            "totalMethods",
+            "totalParameters",
+            "totalComplexity",
+            "maxComplexity",
+            "totalFanOut");
 
     public BaselineComparison compare(AnalysisReport baseline, AnalysisReport target) {
         Map<String, SmellFinding> baseFindings = activeByFingerprint(baseline);
@@ -136,16 +155,12 @@ public class BaselineComparator {
     private List<BaselineComparison.MetricDelta> compareSummaries(
             AnalysisReport baseline, AnalysisReport target) {
         List<BaselineComparison.MetricDelta> deltas = new ArrayList<>();
-        for (String metric : baseline.summary().keySet()) {
+        Set<String> metrics = new LinkedHashSet<>(STRUCTURAL_SUMMARY_METRICS);
+        metrics.retainAll(unionKeys(baseline.summary().keySet(), target.summary().keySet()));
+        for (String metric : metrics) {
             double left = baseline.summary().getOrDefault(metric, 0.0);
             double right = target.summary().getOrDefault(metric, 0.0);
             delta(deltas, "REPORT", "", metric, left, right);
-        }
-        for (String metric : target.summary().keySet()) {
-            if (!baseline.summary().containsKey(metric)) {
-                delta(deltas, "REPORT", "", metric, 0,
-                        target.summary().get(metric));
-            }
         }
         return deltas;
     }
@@ -157,8 +172,15 @@ public class BaselineComparator {
         if (change != 0) {
             sink.add(new BaselineComparison.MetricDelta(
                     metric, scope, qualifiedName,
-                    baselineValue, targetValue, change));
+                    baselineValue, targetValue, change,
+                    change > 0 ? "UP" : "DOWN"));
         }
+    }
+
+    private Set<String> unionKeys(Set<String> left, Set<String> right) {
+        Set<String> all = new LinkedHashSet<>(left);
+        all.addAll(right);
+        return all;
     }
 
     private Map<String, TypeMetrics> types(AnalysisReport report) {
@@ -176,11 +198,24 @@ public class BaselineComparator {
         for (FileMetrics file : report.files()) {
             for (TypeMetrics type : file.types()) {
                 for (MethodMetrics method : type.methods()) {
-                    map.putIfAbsent(method.id(), method);
+                    map.putIfAbsent(matchKey(method), method);
                 }
             }
         }
         return map;
+    }
+
+    private String matchKey(MethodMetrics method) {
+        String fullId = method.id();
+        int hash = fullId.indexOf('#');
+        if (hash < 0) {
+            return fullId;
+        }
+        int parenthesis = fullId.indexOf('(', hash);
+        if (parenthesis < 0) {
+            return fullId;
+        }
+        return fullId.substring(0, hash + 1) + method.name();
     }
 
     private List<String> union(java.util.Set<String> left, java.util.Set<String> right) {
