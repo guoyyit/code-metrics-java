@@ -22,6 +22,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -32,13 +33,34 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * <p>Determinism guarantees: files are scanned in sorted order, findings are
  * sorted, and all aggregate numbers are computed from the same ordered
- * inputs, so repeated runs over identical inputs produce byte-identical
- * reports (apart from timestamps and report id). Each invocation uses local
- * collections only; the only shared components are stateless workers and
- * the bounded memory limiter, so concurrent analyses never cross-talk.
+ * inputs. The report id is derived solely from revision, rule-config hash,
+ * analyzer version and the relative path + content hash of every source
+ * file, so it is stable across repeated, full/incremental, reordered or
+ * restarted runs and never depends on wall-clock time, scheduling or
+ * execution mode. Concurrent analyses carrying the same identity are
+ * serialized, so they cannot interleave their atomic publishes.
  */
 @Service
 public class AnalyzerService {
+
+    /**
+     * Fixed set of stripes used to serialize analyses with the same
+     * deterministic report id. Two submissions hash to the same stripe iff
+     * their report ids match, so identical identities never interleave while
+     * distinct identities usually run in parallel. Stripes are kept for the
+     * process lifetime, which bounds lock memory regardless of the number of
+     * distinct revisions.
+     */
+    private static final int LOCK_STRIPES = 256;
+    private final ReentrantLock[] identityLocks = createLockStripes();
+
+    private static ReentrantLock[] createLockStripes() {
+        ReentrantLock[] locks = new ReentrantLock[LOCK_STRIPES];
+        for (int i = 0; i < locks.length; i++) {
+            locks[i] = new ReentrantLock();
+        }
+        return locks;
+    }
 
     private final MetricsProperties properties;
     private final SourceFileScanner scanner;
@@ -65,78 +87,111 @@ public class AnalyzerService {
     }
 
     public AnalysisReport analyze(AnalysisRequest request) {
-        Instant startedAt = Instant.now();
         Path root = Path.of(request.rootPath() == null ? "." : request.rootPath())
                 .toAbsolutePath().normalize();
+        String revision;
+        String contentFingerprint;
         RuleConfig config = ruleConfigService.current();
         String configHash = ruleConfigService.configHash();
         String analyzerVersion = properties.getAnalyzerVersion();
-        String revision = resolveRevision(root, request.revision());
 
+        // The report id must be known before any heavy work so concurrent
+        // submissions of the same identity can share one lock.
         List<SourceFile> sources = scanner.scan(root);
-        List<FileMetrics> metrics = new ArrayList<>();
-        List<SmellFinding> findings = new ArrayList<>();
-        List<FileFailure> failures = new ArrayList<>();
-        AtomicInteger reusedCount = new AtomicInteger();
+        revision = resolveRevision(root, request.revision());
+        contentFingerprint = contentFingerprint(sources);
+        String reportId = reportId(revision, configHash, analyzerVersion,
+                contentFingerprint);
 
-        ExecutorService executor = Executors.newFixedThreadPool(
-                Math.max(1, properties.getParallelism()),
-                runnable -> {
-                    Thread thread = new Thread(runnable);
-                    thread.setName("file-analyzer-" + thread.getId());
-                    thread.setDaemon(true);
-                    return thread;
-                });
+        ReentrantLock lock = lockFor(reportId);
+        lock.lock();
         try {
-            List<Future<PerFileResult>> futures = new ArrayList<>();
-            for (SourceFile source : sources) {
-                futures.add(executor.submit(() -> processOne(
-                        source, config, configHash, analyzerVersion,
-                        request.incremental(), reusedCount)));
-            }
-            for (Future<PerFileResult> future : futures) {
-                PerFileResult result = future.get();
-                if (result.metrics() != null) {
-                    metrics.add(result.metrics());
+            Instant startedAt = Instant.now();
+            List<FileMetrics> metrics = new ArrayList<>();
+            List<SmellFinding> findings = new ArrayList<>();
+            List<FileFailure> failures = new ArrayList<>();
+            AtomicInteger reusedCount = new AtomicInteger();
+
+            ExecutorService executor = Executors.newFixedThreadPool(
+                    Math.max(1, properties.getParallelism()),
+                    runnable -> {
+                        Thread thread = new Thread(runnable);
+                        thread.setName("file-analyzer-" + thread.getId());
+                        thread.setDaemon(true);
+                        return thread;
+                    });
+            try {
+                List<Future<PerFileResult>> futures = new ArrayList<>();
+                for (SourceFile source : sources) {
+                    futures.add(executor.submit(() -> processOne(
+                            source, config, configHash, analyzerVersion,
+                            request.incremental(), reusedCount)));
                 }
-                findings.addAll(result.findings());
-                if (result.failure() != null) {
-                    failures.add(result.failure());
+                for (Future<PerFileResult> future : futures) {
+                    PerFileResult result = future.get();
+                    if (result.metrics() != null) {
+                        metrics.add(result.metrics());
+                    }
+                    findings.addAll(result.findings());
+                    if (result.failure() != null) {
+                        failures.add(result.failure());
+                    }
                 }
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("analysis interrupted", ex);
+            } catch (java.util.concurrent.ExecutionException ex) {
+                throw new IllegalStateException("analysis failed", ex.getCause());
+            } finally {
+                executor.shutdownNow();
             }
-        } catch (InterruptedException ex) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("analysis interrupted", ex);
-        } catch (java.util.concurrent.ExecutionException ex) {
-            throw new IllegalStateException("analysis failed", ex.getCause());
+
+            metrics.sort(Comparator.comparing(FileMetrics::path));
+            findings = sortAndSuppress(findings);
+            failures.sort(Comparator.comparing(FileFailure::path));
+
+            Instant finishedAt = Instant.now();
+            AnalysisReport report = new AnalysisReport(
+                    reportId,
+                    revision,
+                    analyzerVersion,
+                    configHash,
+                    root.toString(),
+                    request.incremental(),
+                    startedAt,
+                    finishedAt,
+                    "COMPLETED",
+                    List.copyOf(metrics),
+                    findings,
+                    List.copyOf(failures),
+                    summarize(metrics, findings, failures, sources.size(),
+                            reusedCount.get(), request.incremental()));
+            reportRepository.save(report);
+            return report;
         } finally {
-            executor.shutdownNow();
+            lock.unlock();
         }
+    }
 
-        metrics.sort(Comparator.comparing(FileMetrics::path));
-        findings = sortAndSuppress(findings);
-        failures.sort(Comparator.comparing(FileFailure::path));
+    private String contentFingerprint(List<SourceFile> sources) {
+        StringBuilder builder = new StringBuilder();
+        for (SourceFile source : sources) {
+            builder.append(source.path()).append(':')
+                    .append(source.contentHash()).append('\n');
+        }
+        return Fingerprints.sha256(builder.toString());
+    }
 
-        Instant finishedAt = Instant.now();
-        String reportId = "RPT-" + Fingerprints.sha256(
-                revision + "|" + configHash + "|" + startedAt).substring(0, 12);
-        AnalysisReport report = new AnalysisReport(
-                reportId,
-                revision,
-                analyzerVersion,
-                configHash,
-                root.toString(),
-                request.incremental(),
-                startedAt,
-                finishedAt,
-                "COMPLETED",
-                List.copyOf(metrics),
-                findings,
-                List.copyOf(failures),
-                summarize(metrics, findings, failures, sources.size(),
-                        reusedCount.get(), request.incremental()));
-        reportRepository.save(report);
-        return report;
+    private String reportId(String revision, String configHash,
+                            String analyzerVersion, String contentFingerprint) {
+        return "RPT-" + Fingerprints.sha256(
+                revision + "|" + configHash + "|" + analyzerVersion
+                        + "|" + contentFingerprint).substring(0, 12);
+    }
+
+    private ReentrantLock lockFor(String key) {
+        int index = Math.floorMod(key.hashCode(), identityLocks.length);
+        return identityLocks[index];
     }
 
     private PerFileResult processOne(SourceFile source, RuleConfig config,
@@ -185,6 +240,8 @@ public class AnalyzerService {
         int maxComplexity = files.stream()
                 .mapToInt(file -> file.summary().maxComplexity()).max().orElse(0);
         long totalFanOut = files.stream().mapToLong(file -> file.summary().totalFanOut()).sum();
+        long totalParameters = files.stream()
+                .mapToLong(file -> file.summary().totalParameters()).sum();
         long methods = files.stream()
                 .mapToLong(file -> file.summary().totalMethods())
                 .sum();
@@ -198,6 +255,7 @@ public class AnalyzerService {
         summary.put("reusedFiles", (double) reusedFiles);
         summary.put("sourceLinesOfCode", (double) sloc);
         summary.put("totalMethods", (double) methods);
+        summary.put("totalParameters", (double) totalParameters);
         summary.put("totalComplexity", (double) totalComplexity);
         summary.put("maxComplexity", (double) maxComplexity);
         summary.put("totalFanOut", (double) totalFanOut);

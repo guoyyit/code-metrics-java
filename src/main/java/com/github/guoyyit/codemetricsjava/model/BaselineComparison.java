@@ -17,8 +17,11 @@ public record BaselineComparison(
             String qualifiedName,
             double baselineValue,
             double targetValue,
-            double delta
+            double delta,
+            String direction
     ) {
+        public static final String UP = "UP";
+        public static final String DOWN = "DOWN";
     }
 
     public record SummarySnapshot(

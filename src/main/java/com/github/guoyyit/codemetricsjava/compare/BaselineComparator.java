@@ -26,6 +26,21 @@ import java.util.Map;
 @Component
 public class BaselineComparator {
 
+    /**
+     * Report-level summary keys that describe code structure and are
+     * therefore eligible for the metric-delta list. Runtime metadata such as
+     * scanned/analyzed/failed/reused file counts, the incremental flag and
+     * smell hit/exemption counts are deliberately excluded even though they
+     * remain present in the {@code baseline}/{@code target} snapshots.
+     */
+    private static final List<String> STRUCTURAL_REPORT_METRICS = List.of(
+            "sourceLinesOfCode",
+            "totalMethods",
+            "totalParameters",
+            "totalComplexity",
+            "maxComplexity",
+            "totalFanOut");
+
     public BaselineComparison compare(AnalysisReport baseline, AnalysisReport target) {
         Map<String, SmellFinding> baseFindings = activeByFingerprint(baseline);
         Map<String, SmellFinding> targetFindings = activeByFingerprint(target);
@@ -111,41 +126,47 @@ public class BaselineComparator {
 
     private List<BaselineComparison.MetricDelta> compareMethods(
             AnalysisReport baseline, AnalysisReport target) {
-        Map<String, MethodMetrics> base = methods(baseline);
-        Map<String, MethodMetrics> other = methods(target);
+        Map<String, List<MethodMetrics>> base = methods(baseline);
+        Map<String, List<MethodMetrics>> other = methods(target);
         List<BaselineComparison.MetricDelta> deltas = new ArrayList<>();
         for (String name : union(base.keySet(), other.keySet())) {
-            MethodMetrics left = base.get(name);
-            MethodMetrics right = other.get(name);
-            delta(deltas, "METHOD", name, "linesOfCode",
-                    left == null ? 0 : left.linesOfCode(),
-                    right == null ? 0 : right.linesOfCode());
-            delta(deltas, "METHOD", name, "cyclomaticComplexity",
-                    left == null ? 0 : left.cyclomaticComplexity(),
-                    right == null ? 0 : right.cyclomaticComplexity());
-            delta(deltas, "METHOD", name, "parameterCount",
-                    left == null ? 0 : left.parameterCount(),
-                    right == null ? 0 : right.parameterCount());
-            delta(deltas, "METHOD", name, "maxNestingDepth",
-                    left == null ? 0 : left.maxNestingDepth(),
-                    right == null ? 0 : right.maxNestingDepth());
+            List<MethodMetrics> leftOverloads = base.getOrDefault(name, List.of());
+            List<MethodMetrics> rightOverloads = other.getOrDefault(name, List.of());
+            int pairs = Math.max(leftOverloads.size(), rightOverloads.size());
+            for (int i = 0; i < pairs; i++) {
+                MethodMetrics left = i < leftOverloads.size() ? leftOverloads.get(i) : null;
+                MethodMetrics right = i < rightOverloads.size() ? rightOverloads.get(i) : null;
+                compareOneMethod(deltas, name, left, right);
+            }
         }
         return deltas;
+    }
+
+    private void compareOneMethod(List<BaselineComparison.MetricDelta> deltas,
+                                  String name, MethodMetrics left, MethodMetrics right) {
+        delta(deltas, "METHOD", name, "linesOfCode",
+                left == null ? 0 : left.linesOfCode(),
+                right == null ? 0 : right.linesOfCode());
+        delta(deltas, "METHOD", name, "cyclomaticComplexity",
+                left == null ? 0 : left.cyclomaticComplexity(),
+                right == null ? 0 : right.cyclomaticComplexity());
+        delta(deltas, "METHOD", name, "parameterCount",
+                left == null ? 0 : left.parameterCount(),
+                right == null ? 0 : right.parameterCount());
+        delta(deltas, "METHOD", name, "maxNestingDepth",
+                left == null ? 0 : left.maxNestingDepth(),
+                right == null ? 0 : right.maxNestingDepth());
     }
 
     private List<BaselineComparison.MetricDelta> compareSummaries(
             AnalysisReport baseline, AnalysisReport target) {
         List<BaselineComparison.MetricDelta> deltas = new ArrayList<>();
-        for (String metric : baseline.summary().keySet()) {
+        // Iterate the fixed structural allowlist (never raw summary keys) so
+        // runtime metadata can never leak into the delta list.
+        for (String metric : STRUCTURAL_REPORT_METRICS) {
             double left = baseline.summary().getOrDefault(metric, 0.0);
             double right = target.summary().getOrDefault(metric, 0.0);
             delta(deltas, "REPORT", "", metric, left, right);
-        }
-        for (String metric : target.summary().keySet()) {
-            if (!baseline.summary().containsKey(metric)) {
-                delta(deltas, "REPORT", "", metric, 0,
-                        target.summary().get(metric));
-            }
         }
         return deltas;
     }
@@ -157,7 +178,9 @@ public class BaselineComparator {
         if (change != 0) {
             sink.add(new BaselineComparison.MetricDelta(
                     metric, scope, qualifiedName,
-                    baselineValue, targetValue, change));
+                    baselineValue, targetValue, change,
+                    change > 0 ? BaselineComparison.MetricDelta.UP
+                            : BaselineComparison.MetricDelta.DOWN));
         }
     }
 
@@ -171,15 +194,26 @@ public class BaselineComparator {
         return map;
     }
 
-    private Map<String, MethodMetrics> methods(AnalysisReport report) {
-        Map<String, MethodMetrics> map = new LinkedHashMap<>();
+    private Map<String, List<MethodMetrics>> methods(AnalysisReport report) {
+        Map<String, List<MethodMetrics>> map = new LinkedHashMap<>();
         for (FileMetrics file : report.files()) {
             for (TypeMetrics type : file.types()) {
                 for (MethodMetrics method : type.methods()) {
-                    map.putIfAbsent(method.id(), method);
+                    // Match by qualified type + simple method name rather
+                    // than the signature-bearing id, so adding or removing a
+                    // parameter surfaces as a parameterCount delta on the
+                    // same method instead of removed+added. Overloads are
+                    // paired in signature order.
+                    String key = method.location() == null
+                            ? method.name()
+                            : method.location().typeName() + "#" + method.name();
+                    map.computeIfAbsent(key, ignored -> new ArrayList<>())
+                            .add(method);
                 }
             }
         }
+        map.values().forEach(list ->
+                list.sort(Comparator.comparing(MethodMetrics::id)));
         return map;
     }
 
